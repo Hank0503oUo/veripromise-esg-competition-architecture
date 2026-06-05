@@ -2,6 +2,12 @@
 
 此 repository 目前聚焦於系統架構、方法設計、模組拆分與實驗演進，不包含競賽原始資料、外部商業資料、模型權重、私有訓練產物或可直接重建競賽提交的完整程式。
 
+## English Overview
+
+This repository summarizes the architecture of an ESG report paragraph classification system. The task predicts four fields for each paragraph: `promise_status`, `verification_timeline`, `evidence_status`, and `evidence_quality`, using a layered design that combines transformer semantics, rule-based features, external company-year signals, retrieval-based context features, and post-processing logic.
+
+The public repository keeps the system design, feature engineering strategy, version evolution, and evaluation thinking, while excluding the original competition data, commercial data exports, model weights, and private training artifacts.
+
 ## 專案定位
 
 這個專案的目標是處理 ESG 報告段落分類任務，針對單段文字預測四個欄位：
