@@ -8,6 +8,13 @@ This repository summarizes the architecture of an ESG report paragraph classific
 
 The public repository keeps the system design, feature engineering strategy, version evolution, and evaluation thinking, while excluding the original competition data, commercial data exports, model weights, and private training artifacts.
 
+## Current Status
+
+- Status: Completed core competition pipeline
+- Progress stage: completed competition architecture with later exploratory branches documented separately
+- Current focus in this public repository: architecture summary, version evolution, and design rationale
+- Public repository scope: architecture, methodology, and representative experiments only
+
 ## 專案定位
 
 這個專案的目標是處理 ESG 報告段落分類任務，針對單段文字預測四個欄位：
