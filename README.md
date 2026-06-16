@@ -1,486 +1,457 @@
-# ESG Promise Verification Competition
+# ESG Promise Verification Competition Architecture
 
-此 repository 目前聚焦於系統架構、方法設計、模組拆分與實驗演進，不包含競賽原始資料、外部商業資料、模型權重、私有訓練產物或可直接重建競賽提交的完整程式。
+This repository is an architecture-only public summary of an ESG report
+paragraph classification system.
 
-## English Overview
+It documents the modeling design, data-flow thinking, feature layers,
+ensemble strategy, evaluation discipline, and later research branches. It does
+not include the original competition data, commercial data exports, model
+weights, private logits, generated submissions, notebooks with answers, API
+keys, or scripts that directly reconstruct a submission.
 
-This repository summarizes the architecture of an ESG report paragraph classification system. The task predicts four fields for each paragraph: `promise_status`, `verification_timeline`, `evidence_status`, and `evidence_quality`, using a layered design that combines transformer semantics, rule-based features, external company-year signals, retrieval-based context features, and post-processing logic.
+## Current Architecture
 
-The public repository keeps the system design, feature engineering strategy, version evolution, and evaluation thinking, while excluding the original competition data, commercial data exports, model weights, and private training artifacts.
+The latest internal system is a field-level ensemble. It does not rely on one
+large model to answer every label directly. Instead, it combines semantic
+models, domain features, long-context signals, ticker priors, and LLM judge
+probabilities, then assembles the strongest field source per target.
 
-## Current Status
+```mermaid
+flowchart TB
+    subgraph publicScope["Public Repository Scope"]
+        scopeA["Architecture diagrams"]
+        scopeB["Modeling rationale"]
+        scopeC["Ablation conclusions"]
+        scopeD["Privacy and leakage boundaries"]
+    end
 
-- Status: Completed core competition pipeline
-- Progress stage: completed competition architecture with later exploratory branches documented separately
-- Current focus in this public repository: architecture summary, version evolution, and design rationale
-- Public repository scope: architecture, methodology, and representative experiments only
+    subgraph privateInputs["Private / Non-public Inputs"]
+        official["Official labeled paragraph samples"]
+        reports["Public ESG reports parsed into page/chunk text"]
+        companySignals["Company-year structured ESG signals"]
+        materiality["Historical materiality topic table"]
+    end
 
-## 專案定位
+    subgraph featureLayer["Feature Layer"]
+        textNorm["Text normalization\nnumbers, years, cue words"]
+        bert["Chinese transformer branch\nper-field probabilities"]
+        domain["Domain rule features\npromise, evidence, metrics, assurance"]
+        context["Context locator / retrieval features\npage match, table cues, report context"]
+        tickerPrior["Ticker prior\nP(label | company) with smoothing"]
+        materialityPrior["Materiality prior\nhistorical topic similarity"]
+    end
 
-這個專案的目標是處理 ESG 報告段落分類任務，針對單段文字預測四個欄位：
+    subgraph llmLayer["LLM / Judge Layer"]
+        engineA["Engine A\nlong-text LoRA logits"]
+        engineB["Engine B\nalternate LoRA logits"]
+        engineC["Engine C\nfixed few-shot prompt and balanced retrieval"]
+        evJudge["Evidence-status adjudicator\nLLM probability as one feature"]
+        relJudge["Relation judge research branch\npromise-evidence support check"]
+    end
+
+    subgraph stackLayer["Stacking And Calibration"]
+        lgbm["Per-field LightGBM stack"]
+        seedAvg["Multi-seed / multi-engine averaging"]
+        offsets["Class-offset coordinate calibration"]
+        cascade["Legality cascade for normal model decoding"]
+    end
+
+    subgraph fieldBest["Field-level Assembly"]
+        promise["promise_status\nbest semantic ensemble source"]
+        timeline["verification_timeline\nbest semantic ensemble source"]
+        evStatus["evidence_status\nLLM-adjudicator-enhanced stack"]
+        eq["evidence_quality\nbest conservative stack source"]
+        noCascade["No cascade after field transplant\nfield scoring is independent"]
+    end
+
+    subgraph submission["Final Four-column Prediction"]
+        final["id + 4 official labels"]
+    end
+
+    official --> textNorm
+    reports --> context
+    companySignals --> domain
+    materiality --> materialityPrior
+
+    textNorm --> bert
+    textNorm --> domain
+    textNorm --> tickerPrior
+    textNorm --> engineA
+    textNorm --> engineB
+    textNorm --> engineC
+
+    bert --> lgbm
+    domain --> lgbm
+    context --> lgbm
+    tickerPrior --> lgbm
+    materialityPrior --> lgbm
+    engineA --> seedAvg
+    engineB --> seedAvg
+    engineC --> seedAvg
+    seedAvg --> lgbm
+    evJudge --> lgbm
+    relJudge -. "researched, not promoted" .-> lgbm
+
+    lgbm --> offsets
+    offsets --> cascade
+    cascade --> promise
+    cascade --> timeline
+    cascade --> evStatus
+    cascade --> eq
+
+    promise --> noCascade
+    timeline --> noCascade
+    evStatus --> noCascade
+    eq --> noCascade
+    noCascade --> final
+
+    scopeA -. "documents only" .-> featureLayer
+    scopeB -. "documents only" .-> stackLayer
+    scopeC -. "documents only" .-> llmLayer
+    scopeD -. "excludes private assets" .-> privateInputs
+```
+
+## Problem
+
+The task predicts four fields for each ESG report paragraph:
 
 - `promise_status`
 - `verification_timeline`
 - `evidence_status`
 - `evidence_quality`
 
-核心挑戰不是一般情緒分類，而是要同時處理：
+The hard part is not simple topic classification. The model must distinguish
+whether a paragraph contains a promise, whether that promise has a timeline,
+whether evidence exists, and whether the evidence actually supports the
+promise.
 
-- 中文 ESG 專業語意
-- 類別不平衡
-- 多任務標籤依賴
-- 證據充分性與漂綠風險判斷
-- 短文本與長文本證據落差
+This creates several technical pressures:
 
-## 架構目標
+- Chinese ESG terminology is domain-specific.
+- The labels are strongly imbalanced.
+- The four fields have hierarchy-like dependencies.
+- Evidence quality depends on relation judgment, not just keyword overlap.
+- Full reports contain useful context, but blindly adding retrieval noise can
+  hurt.
 
-我把整體系統設計成「語意模型 + 規則特徵 + 表格模型融合 + 邏輯後處理」四層架構，原因是單一模型很難同時兼顧：
+## Data Architecture
 
-- 語意理解能力
-- 少數類別穩定性
-- 可解釋性
-- 標籤邏輯一致性
-- 對資料量偏小情境的泛化能力
-
-## 系統總覽
-
-```mermaid
-flowchart TD
-    A["Competition JSON<br/>ESG short text samples"] --> B["Text Preprocessing"]
-    B --> C["Semantic Encoder"]
-    B --> D["Rule-based Feature Extraction"]
-    B --> E["Optional Long-context Retrieval"]
-
-    C --> C1["Transformer probabilities"]
-    C --> C2["Sentence embedding"]
-
-    D --> D1["Numeric / year features"]
-    D --> D2["Promise / evidence / vague wording signals"]
-    D --> D3["Domain observability features"]
-
-    E --> E1["Nearby report chunk evidence"]
-    E --> E2["Coverage / assurance / year alignment signals"]
-
-    C1 --> F["Feature Fusion Layer"]
-    C2 --> F
-    D1 --> F
-    D2 --> F
-    D3 --> F
-    E1 --> F
-    E2 --> F
-
-    F --> G["LightGBM / tree ensemble per task"]
-    G --> H["Raw four-task predictions"]
-    H --> I["Post-processing Rules"]
-    I --> J["Final submission schema"]
-```
-
-## 內部工程分層
-
-原始專案在內部是分層管理的，這裡只保留概念層介紹，不公開資料與腳本細節：
-
-- `01_原始資料`：官方資料、baseline notebook、競賽規格
-- `02_競賽說明`：實驗設計、版本策略、ablation 記錄、架構決策
-- `03_人工註記`：錯誤分析、規則歸納、資料補標與質檢
-- `04_Demo`：展示範例與 walkthrough
-- `esg_competition`：可重跑的訓練、特徵、檢索、推論與整合程式
-
-這種拆法的目的，是把「研究筆記、人工分析、正式管線、對外展示」分開，避免競賽型專案最後變成只有一堆 notebook、但沒有可說明的系統邏輯。
-
-## 資料工程與清洗架構
-
-這個專案真正的難點之一，不是只有模型，而是要把來源品質差異很大的資料整理成同一條可訓練管線。
-
-我把資料層拆成三條：
-
-- 官方競賽短文本標註資料
-- 公開 ESG 報告長文本資料
-- TEJ / IFRS 公司年結構化資料
+The private project keeps data in separate layers. The public repository only
+describes the design.
 
 ```mermaid
 flowchart LR
-    A["Official competition JSON"] --> H["Training base table"]
-    B["Public ESG report URLs"] --> C["URL resolving"]
-    C --> D["PDF download and validation"]
-    D --> E["PDF parsing / OCR to page JSON"]
-    E --> F["Language split and reorganization"]
-    F --> G["Chunking / context extraction"]
-    G --> H
+    official["Official short-text samples"] --> base["Task sample table"]
+    reports["ESG PDF / HTML reports"] --> parse["Download, validate, parse, OCR when needed"]
+    parse --> chunks["Page-level and chunk-level report text"]
+    company["Company-year ESG signals"] --> normalize["Encoding-aware parsing and ticker-year normalization"]
+    normalize --> companyTable["Company-year feature table"]
+    materiality["Historical materiality topics"] --> topicTable["Ticker-year topic table"]
 
-    I["TEJ / IFRS zip exports"] --> J["Encoding-aware parsing"]
-    J --> K["Ticker / year normalization"]
-    K --> L["Company-year feature table"]
-    L --> H
+    base --> align["Ticker / year / company alignment"]
+    chunks --> align
+    companyTable --> align
+    topicTable --> align
 
-    H --> M["Feature engineering and model training"]
+    align --> features["Feature bank"]
+    features --> training["Training, validation, and deployment pipelines"]
 ```
 
-### 公開報告爬取
+The important design choice is separation. Official labels, long-report
+context, structured company signals, and topic priors are not mixed in raw form.
+They are normalized into feature tables before entering the model stack.
 
-在 v5.3 前後，我除了用官方提供的短文本，也開始建立自己的公開報告資料層，目的是補足：
+## Modeling Layers
 
-- 段落本身缺乏上下文
-- 公司承諾與證據可能分散在不同頁
-- 短文本標註無法完整反映整本報告的支撐訊號
+### 1. Semantic Branch
 
-資料取得流程包含：
+A Chinese transformer branch produces per-field probabilities and compact
+semantic signals. This branch handles paragraph-level language understanding:
+promise wording, completion wording, vague future claims, and evidence-like
+sentences.
 
-- 先從既有公司名、ticker、公司 ESG 網址建立 crawling targets
-- 針對靜態網址做 direct mapping
-- 針對動態頁面做 HTML 解析，抓出實際 PDF 連結
-- 若官網失敗，再 fallback 到公開揭露頁或搜尋引擎結果
+### 2. Domain Feature Branch
 
-這個設計的重點是多策略 fallback，而不是假設每家公司都有乾淨一致的下載入口。
+Rule-derived features encode signals that are easy for humans to define but
+easy for small neural models to miss:
 
-### PDF 下載與解析
+- years and future deadlines
+- percentages, quantities, monetary values, and KPI units
+- assurance, verification, ISO, GRI, TCFD, and audit cues
+- vague action verbs versus concrete measurable actions
+- table-like and numeric-density signals
 
-下載層會先驗證檔頭是不是合法 PDF，再進行全文抽取。抽取策略分成兩種：
+These features are not used as a hand-written classifier. They become inputs to
+the fusion model.
 
-- 可直接解析的 PDF：用 PyMuPDF 轉成逐頁 JSON
-- 結構較差或需 OCR 的 PDF：透過外部 OCR 服務轉成 page-level text blocks，再整理成統一 JSON 結構
+### 3. Context And Retrieval Branch
 
-這裡我特別做了幾件事：
+Full ESG reports are parsed into page-level and chunk-level text. Retrieval
+features estimate whether the paragraph is near a stronger supporting context
+inside the same report.
 
-- 支援 resume，避免大批量下載或抽取中斷後要重跑
-- 自動跳過已完成公司
-- 將輸出統一成 `pdf_url + total_pages + pages` 的結構
-- 之後再做中英分流與重組，方便 retrieval 階段使用
+This branch was useful mainly when its signal was field-specific. A broad
+retrieval feature added to every task can dilute the existing stack, so the
+architecture treats retrieval as a gated feature source.
 
-### TEJ / IFRS 清洗
+### 4. Company Prior Branch
 
-另一條很重要的資料線是 TEJ / IFRS 匯出檔。這些檔案不是一般乾淨 CSV，而是帶有真實商業資料常見問題：
+The competition samples share company identities across train, validation, and
+test. The system therefore uses a smoothed company prior:
 
-- zip 內包 tab-separated CSV
-- `UTF-16` 編碼
-- 欄位名不一定穩定
-- `ticker-year` 可能重複
-- 季資料與年資料要做聚合或取最大月份
+```text
+P(label | ticker) + log(company_sample_count)
+```
 
-所以我做的不是單純 `read_csv`，而是一條清洗流程：
+Validation priors are computed only from training labels, while deployment
+priors can use all available labeled development data. This keeps validation
+free from label leakage while preserving the legal deployment condition.
 
-- 解析壓縮檔與編碼
-- 從 `證券代碼` 抽出乾淨 ticker
-- 正規化 year 欄位
-- 針對 CSR / carbon / disclosure / IFRS 表各自抽欄位
-- 合併成 company-year feature table
-- 再把這張表 join 回競賽樣本
+### 5. LLM Logit And Judge Branch
 
-### 競賽樣本對齊
+LLMs are used as structured feature generators, not as the only final decision
+maker.
 
-官方資料是題目級段落，外部資料是公司年度級，因此還需要對齊層。
+Two styles were tested:
 
-我用的對齊策略是：
+- long-text engines that emit option probabilities for each task
+- adjudicator models that answer a narrower question, such as whether evidence
+  exists for a promise
 
-- 先從文本中推斷 `report_year`
-- 以 `ticker + report_year` 對齊外部資料
-- 若沒有命中，再退一年做 fallback
+The strongest promoted branch was the evidence-status adjudicator. It was added
+as a probability feature to the existing stack rather than used as a direct
+overwrite.
 
-這條設計後來成為 `v4+TEJ`、`v5.x` 之後幾乎所有特徵融合版本的基礎。
-
-## 模組拆解
-
-### 1. Semantic Encoder
-
-第一層使用中文 Transformer 編碼器處理段落語意，輸出：
-
-- 四個任務的 softmax 機率
-- 可供後續融合的語意向量
-
-這一層負責回答「這段話在語意上比較像承諾、成果、空泛敘述，還是具有可驗證證據的陳述」。
-
-### 2. Rule-based Feature Layer
-
-第二層不是取代模型，而是補上模型在小樣本競賽裡常漏掉的硬訊號，例如：
-
-- 是否出現年份、百分比、金額、KPI 單位
-- 是否出現已完成、已揭露、已查證等完成型語句
-- 是否只有持續推動、強化、落實等模糊承諾
-- 是否出現 ISO、GHG、TCFD、確信、保證等證據訊號
-
-這一層特別重要，因為 `evidence_quality` 的判斷高度依賴具體性與可驗證性，而不只是語意相似度。
-
-### 3. Long-context Retrieval Layer
-
-短文本本身有時不足以判斷證據是否真的存在，所以後續版本加入了長文本檢索層，從同公司 ESG 報告中抓取鄰近段落或支撐片段，抽出：
-
-- retrieval score
-- evidence coverage ratio
-- assurance proximity
-- numeric/table proximity
-- year alignment
-
-這一層不是直接做生成式回答，而是把長文本上下文轉成可控的結構化特徵，再交給融合模型使用。
-
-### 4. Fusion Layer
-
-融合層使用 LightGBM / tree ensemble，整合：
-
-- Transformer 機率
-- 語意向量或壓縮表示
-- 規則特徵
-- 外部可觀測性特徵
-- retrieval 特徵
-
-原因是表格模型對異質特徵融合、小樣本、非線性交互與閾值邊界通常更穩，也更容易做誤差分析。
-
-### 5. Post-processing Layer
-
-最後一層保證輸出符合競賽標籤邏輯，例如：
-
-- `promise_status = No` 時，其餘欄位強制轉為 `N/A`
-- `evidence_status = No` 或 `N/A` 時，`evidence_quality` 強制為 `N/A`
-- 年份與時間軸預測需要經過規則修正，避免把目標年誤當報告年
-
-這一層的目標不是灌規則拿分，而是避免模型輸出不合法組合。
-
-## 版本演進
-
-### v4
-
-以 Transformer + domain features + LightGBM stacking 為主線，建立可重跑的 baseline。
-
-重點：
-
-- 先把多任務分類流程穩定化
-- 建立欄位邏輯後處理
-- 導入基礎 domain features
-
-### v5.3 / v5.3c
-
-這一段是整個專案很關鍵的成熟期，因為系統開始從「有想法的 baseline」變成「可作為正式提交流程的底盤」。
-
-v5.3 系列做的事情包括：
-
-- 把可用的 TEJ / IFRS 訊號真正接入特徵表
-- 把數字、年份、承諾詞、完成詞、查證詞等 domain features 系統化
-- 做較保守但更有效的 minimal legality postprocess
-- 對 `Not Clear` 類別進行更細的 calibration
-
-其中 `v5.3c minimal` 成為一個很重要的穩定基線，因為它證明：
-
-- 有些規則值得保留，例如 `promise = No -> 其他欄位 N/A`
-- 有些看似合理的硬規則其實會傷分，例如過度強制 `evidence != Yes -> quality = N/A`
-
-這個階段的代表性價值不是單一分數，而是學會哪些邏輯應該交給模型、哪些應該交給後處理。
-
-### v5.3c 工程架構圖
+## Ensemble Logic
 
 ```mermaid
-flowchart TD
-    A["Competition train/val JSON"] --> B["Text normalization<br/>numbers / years / wording cleanup"]
-    C["TEJ / IFRS zip exports"] --> D["Encoding-aware parsing<br/>UTF-16 TSV / ticker-year normalization"]
-    D --> E["Company-year feature table"]
-    B --> F["Report year inference"]
-    F --> G["Join external features<br/>ticker + report_year"]
-    E --> G
+flowchart TB
+    subgraph engines["Model Engines"]
+        a["Engine A\nlong-text logits"]
+        b["Engine B\nalternate logits"]
+        c["Engine C\nfixed company prompt + balanced few-shot"]
+    end
 
-    B --> H["Shared BERT / MacBERT encoder"]
-    G --> I["v5.3c domain feature extractor<br/>promise words / result words / metrics / TEJ signals"]
+    subgraph features["Shared Feature Bank"]
+        sem["Transformer probabilities"]
+        rules["Rule/domain features"]
+        prior["Ticker priors"]
+        context["Context features"]
+        judge["LLM judge probability"]
+    end
 
-    H --> J1["promise logits"]
-    H --> J2["timeline logits"]
-    H --> J3["evidence_status logits"]
-    H --> J4["evidence_quality logits"]
-
-    J1 --> K1["Task head A<br/>LightGBM"]
-    J2 --> K2["Task head B<br/>LightGBM"]
-    J3 --> K3["Task head C<br/>LightGBM"]
-    J4 --> K4["Task head D<br/>LightGBM"]
-
-    I --> K1
-    I --> K2
-    I --> K3
-    I --> K4
-
-    K1 --> L["Soft calibration"]
-    K2 --> L
-    K3 --> L
-    K4 --> L
-
-    L --> M["Minimal legality<br/>promise = No -> others = N/A"]
-    M --> N["Final 4-column prediction"]
+    engines --> avg["Engine probability averaging"]
+    avg --> stack["Per-field LightGBM"]
+    features --> stack
+    stack --> oof["Group-aware validation OOF"]
+    oof --> calibrate["Class-offset calibration"]
+    calibrate --> decode["Decode labels"]
+    decode --> legal["Normal legality cascade"]
+    legal --> fieldPool["Candidate field predictions"]
+    fieldPool --> transplant["Select best source per field"]
+    transplant --> final["Final prediction table"]
 ```
 
-### v5.1
+The final stage uses field-level assembly because public evaluation confirmed
+that fields are scored independently. After transplanting the best source for
+each field, the system intentionally does not re-apply the cascade; otherwise a
+strong field can be damaged by a weaker field.
 
-聚焦短文本校正，強化 `evidence_status` 與 `evidence_quality`。
-
-新增：
-
-- evidence hardness features
-- claim coverage features
-- 更適合小樣本的 compact feature design
-
-這一版的核心價值是把「有沒有具體證據」拆成更可學習的特徵，而不是只靠 end-to-end 語意分類。
-
-### v6
-
-加入長文本 retrieval signals，把報告中的支持段落資訊轉成特徵。
-
-新增：
-
-- report chunk indexing
-- BM25-style retrieval
-- evidence coverage / assurance / alignment features
-
-這一版的方向是把段落分類從 isolated text 升級成 weakly grounded classification。
-
-### v10 - v14 探索分支
-
-後續我又往兩條更激進的方向推進：
-
-- 任務導向 hybrid / routing
-- Harness prompt + LoRA + logit stacking
-
-這些版本的目的，不是盲目追新模型，而是測試：
-
-- LLM logits 能不能對 `evidence_quality` 帶來增益
-- retrieval 要不要只餵高權重任務
-- pseudo labeling 與 hard negative mining 是否值得增加工程複雜度
-
-其中一條重要結論是：不是所有更大的模型都值得進主線。部分 v13 lite logit stacking 實驗在本地驗證反而退步，因此被明確標記為 no-go，沒有硬塞進最終架構。這也顯示這個專案不是「模型越大越好」，而是有明確的實驗停損點。
-
-### 現在這版工程架構圖
-
-目前的工程狀態可以理解成：
-
-- 穩定主線仍是 BERT / TEJ / stacking 架構
-- 最新版本則把 Qwen3.5-9B QLoRA 當成校準分支
-- LLM 不直接取代分類器，而是把 logits 轉成新特徵再回餵融合層
+## Field-level Strategy
 
 ```mermaid
-flowchart TD
-    A["Official short-text labels<br/>train / public val"] --> B["Core sample table"]
-    C["Public ESG reports<br/>PDF / OCR / chunk library"] --> D["Context assets<br/>page JSON / report chunks"]
-    E["TEJ company-year features"] --> F["Structured external feature table"]
+flowchart LR
+    v18["Prior-enhanced stack"] --> eq["evidence_quality source"]
+    v18c["Three-engine ensemble"] --> promise["promise_status source"]
+    v18c --> timeline["verification_timeline source"]
+    v25["Evidence-status adjudicator stack"] --> ev["evidence_status source"]
 
-    B --> G["Baseline semantic branch<br/>BERT / MacBERT logits"]
-    B --> H["Rule and domain feature branch<br/>v5.3c / v6.3 features"]
-    D --> H
-    F --> H
+    promise --> final["Field-best assembly"]
+    timeline --> final
+    ev --> final
+    eq --> final
 
-    B --> I["Harness SFT dataset builder<br/>sample-field questions"]
-    D --> J["RAG / reasoning dataset builder"]
-
-    I --> K["Stage 1 QLoRA<br/>schema-stable option output"]
-    J --> L["Stage 2 QLoRA<br/>ESG reasoning alignment"]
-    K --> M["Stage 3 option-only calibration"]
-    L --> M
-
-    M --> N["Qwen3.5-9B inference<br/>extract p_A...p_E / margin / entropy"]
-
-    G --> O["Final stacking feature bank"]
-    H --> O
-    N --> O
-
-    O --> P["LightGBM per task / calibrated ensemble"]
-    P --> Q["Soft hierarchy calibration"]
-    Q --> R["Minimal legality and submission assembly"]
-    R --> S["Final prediction.json"]
+    final --> output["Official four-field output"]
 ```
 
-這張圖想表達的重點是：現在這版不是把整套系統改成「LLM 直接分類」，而是把原本已驗證的傳統主線保留，讓 LLM 只負責它最可能有價值的部分，也就是 schema 對齊與 logit 校準。
+This is the main architectural lesson from the project: once field independence
+is verified, improvements can be shipped one field at a time. A better
+evidence-status model does not need to disturb promise, timeline, or evidence
+quality.
 
-## 設計取捨
+## Evidence Quality Bottleneck
 
-### 為什麼不是純 LLM end-to-end
+`evidence_quality` became the main bottleneck. The issue is that the hardest
+class is not merely "unclear wording." It is a relation problem:
 
-因為競賽資料量有限，而且最終輸出是固定四欄分類。若直接依賴大型生成模型，會遇到：
+```mermaid
+flowchart TB
+    p["Promise\nwhat the company claims it will do"] --> relation["Does the evidence support this exact promise?"]
+    e["Evidence\nwhat the paragraph proves or reports"] --> relation
 
-- 可重現性差
-- 成本高
-- 輸出格式穩定性不足
-- 少數類別更難校正
+    relation --> clear["Clear\nspecific and aligned support"]
+    relation --> notClear["Not Clear\nweak, vague, or insufficient support"]
+    relation --> misleading["Misleading\nconcrete-looking evidence but off-topic or mismatched"]
+    relation --> na["N/A\nno applicable promise/evidence path"]
+```
 
-所以我把 LLM / 長文本能力放在輔助特徵層，而不是讓它直接決定最終標籤。
+Several branches failed because they improved surface plausibility without
+improving relation ranking:
 
-### 為什麼需要規則
+- direct EQ specialists
+- binary Clear versus Not Clear calibration
+- generic RAG label distribution
+- local 9B rubric judge
+- relation LLM judge used as an overwrite
+- pseudo-split relation training on test-like prompts
+- broad materiality features
 
-這個任務不是單純語意辨識，還包含標籤間約束。規則層在這裡是 product logic，不是傳統 rule-based classifier。
+The conclusion was not "LLMs are useless." The more precise conclusion is:
+for this dataset, evidence quality needs high-quality promise/evidence splits
+and relation-contrastive supervision. Generic four-class training mostly learns
+the cascade and majority shortcuts.
 
-### 為什麼用融合架構
+## REL9B Research Branch
 
-因為這類問題同時有：
+The 9B relation model branch was designed to train a dedicated
+promise-evidence relation judge with four official classes:
 
-- 語意訊號
-- 結構化硬訊號
-- 外部觀測訊號
-- 任務間依賴
+- Clear
+- Not Clear
+- Misleading
+- N/A
 
-把所有責任壓在單一神經模型上，通常不如分層架構穩定。
+The training design used curriculum ideas:
 
-## 技術堆疊
+```mermaid
+flowchart LR
+    easy["Easy cases\nClear and N/A"] --> boundary["Boundary cases\nNot Clear and hard negatives"]
+    boundary --> misleading["Synthetic / augmented Misleading examples"]
+    misleading --> full["Balanced four-class fine-tuning"]
+    full --> logits["A/B/C/D option logits"]
+    logits --> gate["Validation gate before deployment"]
+```
 
-- Python
-- Transformers
-- PyTorch
-- LightGBM
-- pandas / scikit-learn
-- Markdown / Mermaid for architecture communication
+This branch produced useful research signal, but direct deployment was rejected
+because validation gains did not transfer reliably when gold
+`promise_string` / `evidence_string` splits were unavailable at test time.
 
-## 驗證思路
+## Automatic Splitter Research
 
-我在本地驗證時關注的不只是總分，還特別看：
+Because test samples do not include gold promise/evidence strings, a splitter
+probe was built to infer them from raw paragraphs.
 
-- `evidence_quality` 的 Macro-F1
-- `Not Clear` 類別召回
-- `evidence_status = No` 的辨識能力
-- 邏輯非法輸出的比例
-- 是否有 company leakage 或 future leakage
+```mermaid
+flowchart TB
+    text["Raw paragraph"] --> chunks["Candidate sentence / clause chunks"]
+    chunks --> roleModel["Train-only chunk role classifier"]
+    roleModel --> promiseSplit["Predicted promise snippet"]
+    roleModel --> evidenceSplit["Predicted evidence snippet"]
+    promiseSplit --> relationModel["Relation model prompt"]
+    evidenceSplit --> relationModel
+    relationModel --> eqPred["EQ logits"]
+    eqPred --> emptyGate["N/A empty gate and bias sweep"]
+```
 
-在內部迭代中，架構從 baseline 到短文本校正版本有明顯提升，之後再測試加入長文本檢索的增益與副作用。
+The probe showed that the idea is not impossible, but the bottleneck is the
+empty gate: rows without applicable promise/evidence must stay blank before the
+relation model is called. Without that gate, the splitter fabricates snippets
+and collapses N/A recall.
 
-## 代表性實驗訊號
+## Materiality Feature Branch
 
-這裡只保留代表性的方向性結論，不放完整實驗資產：
+Historical materiality topics were tested as a company-topic prior:
 
-- baseline hybrid 架構先建立可重跑下限
-- `v5.3c` 把系統推進到更穩定的 production-like baseline
-- 短文本校正特徵能明顯改善 `evidence_quality`
-- 長文本 retrieval 對品質判斷有幫助，但若全任務一起吃，可能拖累其他任務
-- 部分 LLM logit stacking 分支在驗證集是 no-go，因此沒有被當成最終答案
+- topic similarity between paragraph text and historical company materiality
+  items
+- E/S/G topic share
+- recency and topic-importance statistics
 
-這些結果代表我的重點不是單次 lucky score，而是建立一個可持續做 ablation、可以知道哪條路值得投資的系統。
+This source had broad ticker coverage, but it mostly duplicated company prior
+information. It is useful as a low-risk feature-bank asset, not as a standalone
+breakthrough.
 
-## 如果要產品化
+## Validation Discipline
 
-若把這套競賽系統往產品化延伸，我會拆成以下服務：
+The project used a strict promotion gate:
 
-- ingestion service：接收報告文本、切段、清理、索引
-- feature service：生成語意特徵、規則特徵、retrieval 特徵
-- inference service：負責四任務推論與邏輯修正
-- evaluation service：追蹤每版模型的 task-level 指標與錯誤類型
-- reviewer console：提供人工 spot check 與錯誤回標介面
+- every new feature must beat the existing stack on grouped validation
+- field-specific gains are preferred over broad noisy changes
+- public feedback is used to validate architecture, not to hand-edit answers
+- branches that do not clear the gate are documented and stopped
+- final assembly preserves the best known source for each independent field
 
-也就是說，這個競賽專案本質上已經具備 service-oriented ML system 的雛形，而不只是單次提交腳本。
+This mattered because many attractive ideas produced local gains but failed
+transfer:
 
-## Repository Scope 與隱私邊界
+- retrieval label distribution that duplicated ticker priors
+- context features that helped one field but polluted others
+- direct relation-model overwrites
+- broad EQ recalibration
+- materiality features as a full-stack add-on
 
-此 repository 不放以下內容：
+## Version Evolution Summary
 
-- 原始競賽資料
-- 商業資料來源與匯出檔
-- 訓練後模型權重
-- 完整實驗腳本與自動提交流程
-- 私有資料路徑、金鑰或外部憑證
+```mermaid
+flowchart LR
+    v4["v4\nTransformer + domain features"] --> v5["v5\nRule and company-signal stabilization"]
+    v5 --> v6["v6\nLong-context retrieval features"]
+    v6 --> v16["v16\nLong-text logits + LightGBM stack"]
+    v16 --> v18["v18\nTicker-prior stack"]
+    v18 --> v18c["v18C\nThird engine + repaired few-shot prompting"]
+    v18c --> v25["v25\nEvidence-status adjudicator feature"]
+    v25 --> research["v27-v34\nRelation, splitter, and materiality research branches"]
 
-目前保留的重點是：
+    research -. "documented but not promoted" .-> v25
+```
 
-- 問題拆解
-- 機器學習系統設計
-- feature engineering
-- multi-stage modeling
-- evaluation and error analysis
-- 競賽型專案的可重跑與可交付思維
+## Why Not End-to-end LLM?
 
-## Further Directions
+The task has fixed labels, small data, severe class imbalance, and strict
+field-level evaluation. A pure generative model creates problems:
 
-- 如何處理 `Misleading` 這種極少數標籤
-- 規則層與模型層邊界怎麼切
-- 如何避免外部資料造成 leakage
-- 為什麼 retrieval 特徵有時候會提升品質判斷，但拉低其他任務
-- 如果要把這套系統產品化，如何改成可維運的 service architecture
+- output-format instability
+- expensive repeated inference
+- weak calibration on minority classes
+- difficulty separating cascade rules from relation judgment
+- unreliable transfer when prompt inputs differ between validation and test
 
-## 備註
+The final architecture therefore uses LLMs where they are strongest:
+generating calibrated probabilities for narrow subquestions, then letting a
+small supervised stack decide how much to trust them.
 
-這個 repository 目前採用 architecture-only 形式。更完整的工程版本牽涉資料來源、實驗細節與訓練資產，因此沒有直接公開在這個 repository 中。
+## Productization View
+
+If turned into a production system, the architecture would become these
+services:
+
+- ingestion service: parse ESG reports and normalize paragraphs
+- feature service: generate semantic, rule, context, and company-prior features
+- judge service: run narrow LLM adjudicators for difficult subquestions
+- inference service: run field-specific stacks and calibration
+- review service: surface uncertain or relation-heavy cases for human audit
+- evaluation service: track field-level F1, drift, and error patterns
+
+## Public Repository Boundary
+
+This repository intentionally excludes:
+
+- raw competition data
+- parsed ESG report text
+- commercial or licensed data exports
+- materiality tables and company-level private feature files
+- trained checkpoints and adapters
+- private logits, OOF tables, and generated submissions
+- API credentials or remote training configuration
+- scripts that directly rebuild the private submission
+
+It keeps:
+
+- architecture diagrams
+- version rationale
+- modeling trade-offs
+- failure analysis
+- privacy and leakage boundaries
+
+The goal is to show the engineering structure and learning path without
+publishing private competition assets.
