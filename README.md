@@ -9,6 +9,43 @@ not include the original competition data, commercial data exports, model
 weights, private logits, generated submissions, notebooks with answers, API
 keys, or scripts that directly reconstruct a submission.
 
+## 中文摘要
+
+這個 repo 只公開架構，不放私人資料、權重、logits 或可直接重建提交檔的腳本。
+
+目前公開可驗證的最佳結果是：
+
+- `submission_v25_evjudge.csv`
+- public WS: `0.6060570`
+
+核心做法不是單一大模型直接猜四欄，而是：
+
+1. 先把 ESG 報告原文整理成段落、頁面與 company-year 特徵。
+2. 再把文字語意、規則特徵、公司先驗、上下文檢索與 LLM judge 融合成欄位級 stack。
+3. 最後只在欄位層級做最佳來源置換，不在欄位置換後重新套 cascade。
+
+你要看的中文架構圖在這裡：
+
+- [v18架構圖.md](v18架構圖.md)
+
+這份圖也收了兩條 Qwen3.5 9B LoRA 支線：
+
+- v14: logit calibration / schema alignment
+- v27: REL9B `evidence_quality` 專家流
+
+### 資料來源與欄位意義
+
+- 官方競賽資料：`promise_status`、`verification_timeline`、`evidence_status`、`evidence_quality`
+- 長文本來源：公司官網、MOPS/TWSE、Yahoo 搜尋與 PDF 解析
+- 外部特徵：TEJ 的 company-year ESG / IFRS 資料
+
+欄位定義重點：
+
+- `data` 是模型真正要看的原始段落
+- `promise_string` / `evidence_string` 是人工標註 span
+- `page_number`、`pdf_url`、`company_source` 用來追溯來源
+- `N/A` 代表欄位不適用，不是缺值
+
 ## Current Architecture
 
 The latest internal system is a field-level ensemble. It does not rely on one
