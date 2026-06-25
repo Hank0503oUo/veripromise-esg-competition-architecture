@@ -16,6 +16,12 @@
 - `submission_v25_evjudge.csv`
 - public WS: `0.6060570`
 
+最終 private-counting 架構補充：
+
+- Private WS: `0.6457201`
+- Private rank: `6/143`
+- final concept: `v43 = v25 base + v39d timeline-only override`
+
 核心做法不是單一大模型直接猜四欄，而是：
 
 1. 先把 ESG 報告原文整理成段落、頁面與 company-year 特徵。
@@ -25,6 +31,7 @@
 你要看的中文架構圖在這裡：
 
 - [v18架構圖.md](v18架構圖.md)
+- [v43最終架構.md](v43最終架構.md)
 
 這份圖也收了兩條 Qwen3.5 9B LoRA 支線：
 
