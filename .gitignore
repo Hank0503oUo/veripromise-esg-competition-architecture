@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# Organizer/test data and generated competition outputs should not be committed
+# to a public GitHub repository unless the organizer explicitly allows it.
+data/
+OUTPUT/
+outputs/
+*.zip
